@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"unsafe"
 )
+
+const HEADER = 4
 
 const (
 	BNODE_NODE = 1 // internal nodes without values
@@ -281,6 +285,263 @@ func nodeReplaceKidN(tree *BTree, new BNode, old BNode, idx uint16, kids ...BNod
 	nodeAppendRange(new, old, idx+inc, idx+1, old.nkeys()-(idx+1))
 }
 
-func main() {
+func (tree *BTree) Insert(key []byte, val []byte) {
+	if tree.root == 0 {
+		// create the first node
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		root.setHeader(BNODE_LEAF, 2)
 
+		// a dummy key, this makes the tree cover the whole key space.
+		// thus a lookup can always find a containing node.
+		nodeAppendKV(root, 0, 0, nil, nil)
+		nodeAppendKV(root, 1, 0, key, val)
+		tree.root = tree.new(root)
+		return
+	}
+
+	node := treeInsert(tree, tree.get(tree.root), key, val)
+	nsplit, split := nodeSplit3(node)
+	tree.del(tree.root)
+	if nsplit > 1 {
+		// the root was split, add a new level.
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		root.setHeader(BNODE_NODE, nsplit)
+
+		for i, knode := range split[:nsplit] {
+			ptr, key := tree.new(knode), knode.getKey(0)
+			nodeAppendKV(root, uint16(i), ptr, key, nil)
+		}
+
+		tree.root = tree.new(root)
+	} else {
+		tree.root = tree.new(split[0])
+	}
+}
+
+func shouldMerge(tree *BTree, node BNode, idx uint16, updated BNode) (int, BNode) {
+	if updated.nbytes() > BTREE_PAGE_SIZE/4 {
+		return 0, BNode{}
+	}
+
+	if idx > 0 {
+		sibling := BNode(tree.get(node.getPtr(idx - 1)))
+		merged := sibling.nbytes() + updated.nbytes() - HEADER
+		if merged <= BTREE_PAGE_SIZE {
+			return -1, sibling // left
+		}
+	}
+
+	if idx+1 < node.nkeys() {
+		sibling := BNode(tree.get(node.getPtr(idx + 1)))
+		merged := sibling.nbytes() + updated.nbytes() - HEADER
+		if merged <= BTREE_PAGE_SIZE {
+			return +1, sibling // right
+		}
+	}
+
+	return 0, BNode{}
+}
+
+// Implement missing nodeMerge function(by ChatGPT)
+func nodeMerge(dest BNode, left BNode, right BNode) {
+	dest.setHeader(left.btype(), left.nkeys()+right.nkeys())
+	nodeAppendRange(dest, left, 0, 0, left.nkeys())
+	nodeAppendRange(dest, right, left.nkeys(), 0, right.nkeys())
+}
+
+// Implement missing nodeReplace2Kid function(by ChatGPT)
+func nodeReplace2Kid(new BNode, old BNode, idx uint16, ptr uint64, key []byte) {
+	new.setHeader(BNODE_NODE, old.nkeys()-1)
+	nodeAppendRange(new, old, 0, 0, idx)
+	nodeAppendKV(new, idx, ptr, key, nil)
+	nodeAppendRange(new, old, idx+1, idx+2, old.nkeys()-(idx+1))
+}
+
+// by ChatGPT
+func treeSearch(tree *BTree, node BNode, key []byte) ([]byte, bool) {
+	idx := nodeLookupLE(node, key)
+
+	switch node.btype() {
+	case BNODE_LEAF:
+		if idx < node.nkeys() && bytes.Equal(node.getKey(idx), key) {
+			return node.getVal(idx), true
+		}
+		return nil, false
+
+	case BNODE_NODE:
+		return treeSearch(tree, tree.get(node.getPtr(idx)), key)
+	}
+
+	return nil, false
+}
+
+// by ChatGPT
+func (tree *BTree) Search(key []byte) ([]byte, bool) {
+	if tree.root == 0 {
+		return nil, false
+	}
+	return treeSearch(tree, tree.get(tree.root), key)
+}
+
+// by ChatGPT
+func treeDelete(tree *BTree, node BNode, key []byte) BNode {
+	idx := nodeLookupLE(node, key)
+
+	switch node.btype() {
+	case BNODE_LEAF:
+		if idx < node.nkeys() && bytes.Equal(node.getKey(idx), key) {
+			new := BNode(make([]byte, BTREE_PAGE_SIZE))
+			new.setHeader(BNODE_LEAF, node.nkeys()-1)
+			nodeAppendRange(new, node, 0, 0, idx)
+			nodeAppendRange(new, node, idx, idx+1, node.nkeys()-idx-1)
+			return new
+		}
+		return BNode{}
+
+	case BNODE_NODE:
+		updated := nodeDelete(tree, node, idx, key)
+		if len(updated) == 0 {
+			return BNode{}
+		}
+		return updated
+	}
+
+	return BNode{}
+}
+
+// by ChatGPT
+func (tree *BTree) Delete(key []byte) {
+	if tree.root == 0 {
+		return
+	}
+	node := treeDelete(tree, tree.get(tree.root), key)
+	if len(node) > 0 {
+		tree.root = tree.new(node)
+	}
+}
+
+// by ChatGPT
+func treeTraverse(tree *BTree, node BNode, visit func(key, val []byte)) {
+	switch node.btype() {
+	case BNODE_LEAF:
+		for i := uint16(1); i < node.nkeys(); i++ {
+			visit(node.getKey(i), node.getVal(i))
+		}
+	case BNODE_NODE:
+		for i := uint16(0); i < node.nkeys(); i++ {
+			treeTraverse(tree, tree.get(node.getPtr(i)), visit)
+		}
+	}
+}
+
+// by ChatGPT
+func (tree *BTree) Traverse(visit func(key, val []byte)) {
+	if tree.root == 0 {
+		return
+	}
+	treeTraverse(tree, tree.get(tree.root), visit)
+}
+
+// delete a key from an internal node; part of the treeDelete()
+func nodeDelete(tree *BTree, node BNode, idx uint16, key []byte) BNode {
+	// recurse into the kid
+	kptr := node.getPtr(idx)
+	updated := treeDelete(tree, tree.get(kptr), key)
+	if len(updated) == 0 {
+		return BNode{} // not found
+	}
+	tree.del(kptr)
+
+	new := BNode(make([]byte, BTREE_PAGE_SIZE))
+	// check for merging
+	mergeDir, sibling := shouldMerge(tree, node, idx, updated)
+	switch {
+	case mergeDir < 0: // left
+		merged := BNode(make([]byte, BTREE_PAGE_SIZE))
+		nodeMerge(merged, sibling, updated)
+		tree.del(node.getPtr(idx - 1))
+		nodeReplace2Kid(new, node, idx-1, tree.new(merged), merged.getKey(0))
+
+	case mergeDir > 0: // right
+		merged := BNode(make([]byte, BTREE_PAGE_SIZE))
+		nodeMerge(merged, updated, sibling)
+		tree.del(node.getPtr(idx + 1))
+		nodeReplace2Kid(new, node, idx, tree.new(merged), merged.getKey(0))
+
+	case mergeDir == 0 && updated.nkeys() == 0:
+		assert(node.nkeys() == 1 && idx == 0) // 1 empty child but no sibling
+		new.setHeader(BNODE_NODE, 0)          // the parent becomes empty too
+
+	case mergeDir == 0 && updated.nkeys() > 0: // no merge
+		nodeReplaceKidN(tree, new, node, idx, updated)
+	}
+
+	return new
+}
+
+type C struct {
+	tree  BTree
+	ref   map[string]string // the reference data
+	pages map[uint64]BNode  // in-memory pages
+}
+
+func newC() *C {
+	pages := map[uint64]BNode{}
+
+	return &C{
+		tree: BTree{
+			get: func(ptr uint64) []byte {
+				node, ok := pages[ptr]
+				assert(ok)
+				return node
+			},
+			new: func(node []byte) uint64 {
+				assert(BNode(node).nbytes() <= BTREE_PAGE_SIZE)
+				ptr := uint64(uintptr(unsafe.Pointer(&node[0])))
+				assert(pages[ptr] == nil)
+				pages[ptr] = node
+				return ptr
+			},
+			del: func(ptr uint64) {
+				assert(pages[ptr] != nil)
+				delete(pages, ptr)
+			},
+		},
+		ref:   map[string]string{},
+		pages: pages,
+	}
+}
+
+func (c *C) add(key string, val string) {
+	c.tree.Insert([]byte(key), []byte(val))
+	c.ref[key] = val // reference data
+}
+
+func main() {
+	// Initialize the B+ Tree
+	btree := newC()
+
+	// Insert some key-value pairs
+	btree.add("apple", "red")
+	btree.add("banana", "yellow")
+	btree.add("grape", "purple")
+	btree.add("orange", "orange")
+	btree.add("cherry", "red")
+
+	// Traverse the tree and print key-value pairs
+	fmt.Println("B+ Tree Contents:")
+	btree.tree.Traverse(func(key, val []byte) {
+		fmt.Printf("%s -> %s\n", string(key), string(val))
+	})
+
+	// Test searching for keys
+	searchKeys := []string{"apple", "banana", "mango"}
+	fmt.Println("\nSearch Results:")
+	for _, key := range searchKeys {
+		if value, found := btree.tree.Search([]byte(key)); found {
+			fmt.Printf("Found: %s -> %s\n", key, string(value))
+		} else {
+			fmt.Printf("Not Found: %s\n", key)
+		}
+	}
 }
